@@ -1,0 +1,8 @@
+{
+  "name": "Remix: PersonaX: Ultra-Customizable AI Companion",
+  "description": "A high-fidelity AI character platform with real-time voice, text interaction, and cinematic video generation. Customize every detail of your companion's personality, tone, and relationship.",
+  "requestFramePermissions": [
+    "microphone",
+    "camera"
+  ]
+}
