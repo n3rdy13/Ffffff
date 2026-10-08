@@ -52,3 +52,8 @@ phone; nothing is sent anywhere except to Google's Gemini API.
 live voice, and image generation via `gemini-2.5-flash-image`). Video
 generation (Veo) and Imagen portraits require an API key from a project with
 billing enabled; the app falls back or explains this when they're unavailable.
+
+You can switch models in the app itself — the model chip above the chat box
+picks the chat model, and the voice screen's settings (sliders icon) pick the
+voice model. Both lists are fetched live from the API, so they always show
+what your key can use.

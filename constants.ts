@@ -415,12 +415,3 @@ export const buildImagePrompt = (char: Partial<Character>): string => {
     Setting: Soft studio lighting, cinematic atmosphere, 8k resolution, detailed facial features.`.trim();
 };
 
-export const REASSURING_VIDEO_MESSAGES = [
-  "Setting the scene for your story...",
-  "Directing the digital actors...",
-  "Lighting up the cinematic atmosphere...",
-  "Rendering every frame with precision...",
-  "Your companion is preparing for their debut...",
-  "Almost finished capturing the magic...",
-  "Adding the final polish to your video..."
-];

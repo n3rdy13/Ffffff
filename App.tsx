@@ -1,10 +1,10 @@
 
 import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Character, Message, Relationship } from './types';
-import { DEFAULT_CHARACTERS, DISCOVER_CHARACTERS, getBondDescription, REASSURING_VIDEO_MESSAGES } from './constants';
+import { DEFAULT_CHARACTERS, DISCOVER_CHARACTERS, getBondDescription } from './constants';
 import CharacterCreator from './components/CharacterCreator';
 import VoiceInterface from './components/VoiceInterface';
-import { startTextChat, summarizeMemory, analyzeRelationship, generateVideo, speakText, hasApiKey, saveApiKey } from './services/geminiService';
+import { startTextChat, summarizeMemory, analyzeRelationship, generateVideo, speakText, hasApiKey, saveApiKey, messagesToHistory, getTextModel, setTextModel, listAvailableModels, ModelOption, TtsStage, TTS_STAGES, VideoProgress } from './services/geminiService';
 
 interface SavedChat {
   id: string;
@@ -51,16 +51,22 @@ const App: React.FC = () => {
   const [discoverSort, setDiscoverSort] = useState<'newest' | 'popular'>('popular');
   const [discoverFilter, setDiscoverFilter] = useState<Relationship | 'All'>('All');
 
-  // TTS State
+  // TTS State — which message is being spoken, and the real pipeline stage it's in
   const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
+  const [ttsStage, setTtsStage] = useState<TtsStage | null>(null);
 
   // API Key State
   const [showKeyModal, setShowKeyModal] = useState(() => !hasApiKey());
   const [keyInput, setKeyInput] = useState('');
 
+  // Model picker
+  const [textModel, setTextModelState] = useState(getTextModel());
+  const [showModelPicker, setShowModelPicker] = useState(false);
+  const [chatModels, setChatModels] = useState<ModelOption[]>([]);
+
   // Video Generation States
   const [isVideoGenerating, setIsVideoGenerating] = useState(false);
-  const [videoMessageIndex, setVideoMessageIndex] = useState(0);
+  const [videoProgress, setVideoProgress] = useState<VideoProgress | null>(null);
   const [generatedVideoUrl, setGeneratedVideoUrl] = useState<string | null>(null);
   const [showVideo, setShowVideo] = useState(false);
 
@@ -87,14 +93,13 @@ const App: React.FC = () => {
   }, [messages, isTyping]);
 
   useEffect(() => {
-    let interval: any;
-    if (isVideoGenerating) {
-      interval = setInterval(() => {
-        setVideoMessageIndex(prev => (prev + 1) % REASSURING_VIDEO_MESSAGES.length);
-      }, 5000);
-    }
-    return () => clearInterval(interval);
-  }, [isVideoGenerating]);
+    if (!showModelPicker || chatModels.length) return;
+    let cancelled = false;
+    listAvailableModels().then(models => {
+      if (!cancelled) setChatModels(models.chat);
+    });
+    return () => { cancelled = true; };
+  }, [showModelPicker, chatModels.length]);
 
   // Handle Camera Stream Cleanup
   useEffect(() => {
@@ -137,13 +142,23 @@ const App: React.FC = () => {
     }
   };
 
-  const initChat = (char: Character) => {
+  const initChat = (char: Character, history?: Message[]) => {
     try {
-      chatRef.current = startTextChat(char);
+      chatRef.current = startTextChat(char, history ? messagesToHistory(history) : undefined);
     } catch (error) {
       console.error("Could not start chat:", error);
       chatRef.current = null;
       setShowKeyModal(true);
+    }
+  };
+
+  const handleSelectModel = (modelId: string) => {
+    setTextModel(modelId);
+    setTextModelState(modelId);
+    setShowModelPicker(false);
+    // Rebuild the live chat on the new model, keeping the conversation
+    if (activeCharacter && chatRef.current) {
+      initChat(activeCharacter, messages);
     }
   };
 
@@ -243,7 +258,7 @@ const App: React.FC = () => {
     const textToSend = customPrompt || inputText;
     if (!textToSend.trim() || !chatRef.current || isTyping || !activeCharacter) return;
 
-    const sentMessages: Message[] = [];
+    let baseMessages = messages;
     if (!customPrompt) {
         const userMessage: Message = {
           id: Date.now().toString(),
@@ -251,11 +266,18 @@ const App: React.FC = () => {
           text: textToSend,
           timestamp: Date.now()
         };
-        sentMessages.push(userMessage);
-        setMessages(prev => [...prev, userMessage]);
+        baseMessages = [...messages, userMessage];
+        setMessages(baseMessages);
     }
 
     setInputText('');
+    await sendToModel(textToSend, baseMessages);
+  };
+
+  // baseMessages = the on-screen conversation at the moment of sending (the
+  // user message included), so memory/bond analysis sees the full exchange.
+  const sendToModel = async (textToSend: string, baseMessages: Message[]) => {
+    if (!activeCharacter || !chatRef.current) return;
     setIsTyping(true);
 
     try {
@@ -267,7 +289,7 @@ const App: React.FC = () => {
         timestamp: Date.now()
       };
 
-      const updatedHistory = [...messages, ...sentMessages, aiMessage];
+      const updatedHistory = [...baseMessages, aiMessage];
       setMessages(prev => [...prev, aiMessage]);
 
       if (updatedHistory.length > 0 && updatedHistory.length % 6 === 0) {
@@ -275,8 +297,8 @@ const App: React.FC = () => {
           summarizeMemory(activeCharacter, updatedHistory),
           analyzeRelationship(activeCharacter, updatedHistory)
         ]).then(([newMemory, relData]) => {
-          const updatedChar = { 
-            ...activeCharacter, 
+          const updatedChar = {
+            ...activeCharacter,
             memory: newMemory,
             bondLevel: relData.bondLevel,
             bondStatus: relData.bondStatus
@@ -302,11 +324,46 @@ const App: React.FC = () => {
     }
   };
 
+  // Regenerate the answer to the last user message: drop everything after it,
+  // rebuild the chat from the history before it, and re-send the same text
+  // (temperature 0.9 gives a different sample).
+  const handleRetry = async () => {
+    if (!activeCharacter || isTyping) return;
+    const userIdx = messages.map(m => m.role).lastIndexOf('user');
+    if (userIdx < 0) return;
+    const baseMessages = messages.slice(0, userIdx + 1);
+    setMessages(baseMessages);
+    initChat(activeCharacter, baseMessages.slice(0, userIdx));
+    if (!chatRef.current) return;
+    await sendToModel(baseMessages[userIdx].text, baseMessages);
+  };
+
+  // The last model response (or a trailing error) can be retried, as long as a
+  // user message precedes it — never the opening greeting.
+  const lastMessage = messages[messages.length - 1];
+  const canRetry = !isTyping
+    && !!chatRef.current
+    && !!lastMessage
+    && (lastMessage.role === 'model' || lastMessage.role === 'system')
+    && messages.some(m => m.role === 'user');
+
   const handleSpeakMessage = async (msgId: string, text: string) => {
     if (!activeCharacter || speakingMsgId) return;
     setSpeakingMsgId(msgId);
-    await speakText(text, activeCharacter);
-    setSpeakingMsgId(null);
+    setTtsStage('request');
+    try {
+      await speakText(text, activeCharacter, stage => setTtsStage(stage));
+      setSpeakingMsgId(null);
+      setTtsStage(null);
+    } catch (error: any) {
+      // Leave the error state visible briefly so the tap doesn't just "do nothing"
+      setTtsStage('error');
+      setTimeout(() => {
+        setSpeakingMsgId(null);
+        setTtsStage(null);
+      }, 2500);
+      if (/api key/i.test(error?.message || '')) setShowKeyModal(true);
+    }
   };
 
   const handleGenerateVideoClick = async () => {
@@ -325,7 +382,7 @@ const App: React.FC = () => {
     }
 
     setIsVideoGenerating(true);
-    setVideoMessageIndex(0);
+    setVideoProgress(null);
 
     let cameraFrame = null;
     if (isCameraActive && videoRef.current) {
@@ -340,7 +397,7 @@ const App: React.FC = () => {
     }
 
     try {
-      const videoUrl = await generateVideo(activeCharacter, messages.slice(-5), cameraFrame);
+      const videoUrl = await generateVideo(activeCharacter, messages.slice(-5), cameraFrame, p => setVideoProgress(p));
       if (videoUrl) {
         setGeneratedVideoUrl(videoUrl);
       }
@@ -359,6 +416,7 @@ const App: React.FC = () => {
       }
     } finally {
       setIsVideoGenerating(false);
+      setVideoProgress(null);
     }
   };
 
@@ -383,7 +441,8 @@ const App: React.FC = () => {
     // If we're editing the currently active character, we must refresh the chat logic
     if (activeCharacter?.id === char.id) {
         setActiveCharacter(char);
-        initChat(char);
+        // Rebuild on the new persona, keeping the conversation so far
+        initChat(char, messages);
         // We don't clear messages here so the conversation continues with the new logic
         setMessages(prev => [...prev, {
             id: Date.now().toString(),
@@ -564,7 +623,7 @@ const App: React.FC = () => {
                 <button onClick={handleExportChat} className="p-1.5 md:p-2 text-slate-500 hover:text-white transition-all rounded-full hover:bg-slate-800">
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
                 </button>
-                <button onClick={() => setShowVoice(true)} className="p-2 bg-purple-600 hover:bg-purple-500 text-white rounded-full transition-all shadow-lg">
+                <button onClick={() => setShowVoice(true)} title="Voice chat" className="p-2 bg-purple-600 hover:bg-purple-500 text-white rounded-full transition-all shadow-lg">
                   <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-20a3 3 0 00-3 3v10a3 3 0 006 0V3a3 3 0 00-3-3z" /></svg>
                 </button>
               </div>
@@ -581,16 +640,52 @@ const App: React.FC = () => {
               {messages.map(msg => (
                 <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : msg.role === 'system' ? 'justify-center' : 'justify-start'} animate-in slide-in-from-bottom-2 duration-300`}>
                   {msg.role === 'system' ? (
-                      <div className="bg-purple-900/20 border border-purple-500/20 px-4 py-1.5 rounded-full text-[10px] font-bold text-purple-400 uppercase tracking-widest">{msg.text}</div>
+                      <div className="flex flex-col items-center gap-2 max-w-[90%]">
+                        <div className="bg-purple-900/20 border border-purple-500/20 px-4 py-1.5 rounded-full text-[10px] font-bold text-purple-400 uppercase tracking-widest text-center">{msg.text}</div>
+                        {canRetry && msg.id === lastMessage?.id && (
+                          <button
+                            onClick={handleRetry}
+                            className="px-4 py-1.5 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-full text-[10px] font-bold text-slate-300 uppercase tracking-widest flex items-center gap-1.5 transition-all"
+                          >
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                            Retry
+                          </button>
+                        )}
+                      </div>
                   ) : (
                     <div className={`max-w-[90%] md:max-w-[85%] rounded-2xl p-3.5 md:p-4 ${msg.role === 'user' ? 'bg-purple-600 text-white rounded-tr-none' : 'glass-panel text-slate-200 border-l-4 border-l-pink-500 rounded-tl-none shadow-xl'}`}>
                         <p className="text-sm md:text-base leading-relaxed whitespace-pre-wrap">{msg.text}</p>
-                        <div className="flex items-center justify-between mt-2">
+                        <div className="flex items-center justify-between mt-2 gap-3">
                           <div className="text-[10px] opacity-40">{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
                           {msg.role === 'model' && (
-                            <button onClick={() => handleSpeakMessage(msg.id, msg.text)} className={`p-1 transition-colors ${speakingMsgId === msg.id ? 'text-pink-500 animate-pulse' : 'text-slate-500 hover:text-pink-400'}`}>
-                              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" /></svg>
-                            </button>
+                            speakingMsgId === msg.id && ttsStage ? (
+                              /* Real TTS pipeline position, not a generic pulse */
+                              <div className={`flex items-center gap-1.5 text-[9px] font-bold uppercase tracking-widest ${ttsStage === 'error' ? 'text-red-400' : 'text-pink-400'}`}>
+                                {ttsStage === 'error' ? (
+                                  <span>Audio failed</span>
+                                ) : (
+                                  <>
+                                    {TTS_STAGES.map(s => (
+                                      <span key={s.stage} className={`w-1.5 h-1.5 rounded-full transition-colors ${(TTS_STAGES.find(x => x.stage === ttsStage)?.step ?? 4) >= s.step ? 'bg-pink-500' : 'bg-slate-600'}`} />
+                                    ))}
+                                    <span className="ml-1">
+                                      {ttsStage === 'done' ? 'Done' : `${TTS_STAGES.find(x => x.stage === ttsStage)?.step ?? 4}/4 · ${TTS_STAGES.find(x => x.stage === ttsStage)?.label ?? 'Playing'}`}
+                                    </span>
+                                  </>
+                                )}
+                              </div>
+                            ) : (
+                              <div className="flex items-center gap-1">
+                                {canRetry && msg.id === lastMessage?.id && (
+                                  <button onClick={handleRetry} title="Regenerate response" className="p-1 text-slate-500 hover:text-purple-400 transition-colors">
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                                  </button>
+                                )}
+                                <button onClick={() => handleSpeakMessage(msg.id, msg.text)} title="Play audio" className="p-1 text-slate-500 hover:text-pink-400 transition-colors">
+                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" /></svg>
+                                </button>
+                              </div>
+                            )
                           )}
                         </div>
                     </div>
@@ -611,15 +706,25 @@ const App: React.FC = () => {
             {/* Chat Input */}
             <div className="p-3 md:p-4 border-t border-slate-800 glass-panel sticky bottom-0">
               <div className="flex gap-2 mb-2 overflow-x-auto no-scrollbar">
-                 <button 
+                 <button
+                  type="button"
+                  onClick={() => setShowModelPicker(true)}
+                  title="Choose Gemini model"
+                  className="whitespace-nowrap flex-none px-4 py-2 bg-slate-800/80 border border-slate-700 text-slate-300 text-[10px] font-bold rounded-xl flex items-center justify-center gap-2 hover:border-purple-500/50 hover:text-white transition-all"
+                 >
+                   <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" /></svg>
+                   {textModel.replace(/^gemini-/, '')}
+                 </button>
+                 <button
                   onClick={handleGenerateVideoClick}
                   disabled={isVideoGenerating}
                   className="whitespace-nowrap flex-none px-4 py-2 bg-gradient-to-r from-purple-600 to-rose-600 text-white text-[10px] font-bold rounded-xl flex items-center justify-center gap-2 hover:opacity-90 transition-all disabled:opacity-50"
                  >
                    {isVideoGenerating ? (
+                     /* Real pipeline position reported by generateVideo, not a canned message */
                      <>
                        <div className="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full" />
-                       {REASSURING_VIDEO_MESSAGES[videoMessageIndex]}
+                       {videoProgress ? `${videoProgress.step}/${videoProgress.totalSteps} · ${videoProgress.label}` : 'Starting…'}
                      </>
                    ) : (
                      <>
@@ -754,6 +859,56 @@ const App: React.FC = () => {
           >
             Close
           </button>
+        </div>
+      )}
+
+      {/* Model Picker Modal */}
+      {showModelPicker && (
+        <div className="fixed inset-0 z-[60] safe-area flex items-center justify-center bg-black/70 backdrop-blur-sm p-4" onClick={() => setShowModelPicker(false)}>
+          <div className="glass-panel w-full max-w-md rounded-3xl border border-purple-500/30 p-6 md:p-8 animate-in fade-in zoom-in duration-300 max-h-[80vh] flex flex-col" onClick={e => e.stopPropagation()}>
+            <h3 className="text-xl font-outfit font-bold text-white mb-2">Chat Model</h3>
+            <p className="text-xs text-slate-400 leading-relaxed mb-5">
+              Models your API key can use, fetched live from Google. Switching keeps the current conversation.
+            </p>
+            <div className="flex-1 overflow-y-auto space-y-2 -mx-1 px-1">
+              {chatModels.length === 0 && (
+                <div className="flex items-center gap-3 text-slate-400 text-xs py-4">
+                  <div className="animate-spin h-4 w-4 border-2 border-purple-500 border-t-transparent rounded-full" />
+                  Fetching available models…
+                </div>
+              )}
+              {!chatModels.some(m => m.id === textModel) && chatModels.length > 0 && (
+                <button
+                  onClick={() => handleSelectModel(textModel)}
+                  className="w-full text-left p-4 rounded-2xl border bg-purple-600/20 border-purple-500/50 transition-all"
+                >
+                  <div className="text-sm font-bold text-white">{textModel}</div>
+                  <div className="text-[10px] text-slate-400 mt-0.5">current selection</div>
+                </button>
+              )}
+              {chatModels.map(m => (
+                <button
+                  key={m.id}
+                  onClick={() => handleSelectModel(m.id)}
+                  className={`w-full text-left p-4 rounded-2xl border transition-all ${m.id === textModel ? 'bg-purple-600/20 border-purple-500/50' : 'bg-slate-900/50 border-slate-800 hover:border-slate-600'}`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-sm font-bold text-white truncate">{m.label}</div>
+                    {m.id === textModel && (
+                      <svg className="w-4 h-4 text-purple-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                    )}
+                  </div>
+                  <div className="text-[10px] text-slate-500 mt-0.5 font-mono truncate">{m.id}</div>
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setShowModelPicker(false)}
+              className="mt-5 w-full py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold rounded-xl transition-all text-xs uppercase tracking-widest"
+            >
+              Close
+            </button>
+          </div>
         </div>
       )}
 

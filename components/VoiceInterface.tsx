@@ -3,13 +3,23 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { Character } from '../types';
 import { buildSystemPrompt, EMOTION_OPTIONS } from '../constants';
-import { decodeAudioData, decodePCM, encodePCM, getApiKey, LIVE_MODEL, setAudioSessionType } from '../services/geminiService';
+import { decodeAudioData, decodePCM, encodePCM, getApiKey, getLiveModel, setLiveModel, listAvailableModels, ModelOption, setAudioSessionType } from '../services/geminiService';
 
 interface VoiceInterfaceProps {
   character: Character;
   onClose: () => void;
   onSettingsChange?: (newSettings: Character['voiceSettings']) => void;
 }
+
+type Phase = 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking';
+
+const PHASE_LABELS: Record<Phase, string> = {
+  idle: 'Off',
+  connecting: 'Connecting',
+  listening: 'Listening — just talk',
+  thinking: 'Thinking',
+  speaking: 'Speaking',
+};
 
 function resample(data: Float32Array, fromRate: number, toRate: number): Float32Array {
   if (Math.abs(fromRate - toRate) < 1) return data;
@@ -23,13 +33,18 @@ function resample(data: Float32Array, fromRate: number, toRate: number): Float32
 }
 
 const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onSettingsChange }) => {
-  const [isActive, setIsActive] = useState(false);
-  const [isConnecting, setIsConnecting] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [phase, setPhaseState] = useState<Phase>('idle');
+  const [phaseSince, setPhaseSince] = useState(Date.now());
+  const [nowTick, setNowTick] = useState(Date.now());
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [userTranscript, setUserTranscript] = useState('');
+  const [modelTranscript, setModelTranscript] = useState('');
   const [showTuning, setShowTuning] = useState(false);
-  
+
   const [tuning, setTuning] = useState(character.voiceSettings);
-  
+  const [voiceModels, setVoiceModels] = useState<ModelOption[]>([{ id: getLiveModel(), label: getLiveModel() }]);
+  const [liveModel, setLiveModelState] = useState(getLiveModel());
+
   const audioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
@@ -37,8 +52,40 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const phaseRef = useRef<Phase>('idle');
+  const closingRef = useRef(false);
+  const thinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const turnDoneRef = useRef(true);
+
+  const isActive = phase === 'listening' || phase === 'thinking' || phase === 'speaking';
+  const isConnecting = phase === 'connecting';
+  const isSpeaking = phase === 'speaking';
+
+  const setPhase = useCallback((next: Phase) => {
+    if (phaseRef.current === next) return;
+    phaseRef.current = next;
+    setPhaseState(next);
+    setPhaseSince(Date.now());
+  }, []);
+
+  // Elapsed-time ticker for the status pill
+  useEffect(() => {
+    if (phase === 'idle') return;
+    const interval = setInterval(() => setNowTick(Date.now()), 500);
+    return () => clearInterval(interval);
+  }, [phase]);
+
+  useEffect(() => {
+    let cancelled = false;
+    listAvailableModels().then(models => {
+      if (!cancelled && models.voice.length) setVoiceModels(models.voice);
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   const cleanup = useCallback(() => {
+    closingRef.current = true;
+    if (thinkTimerRef.current) clearTimeout(thinkTimerRef.current);
     if (sessionRef.current) {
       try { sessionRef.current.close?.(); } catch (e) {}
       sessionRef.current = null;
@@ -59,9 +106,8 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
       outputAudioContextRef.current.close().catch(console.error);
       outputAudioContextRef.current = null;
     }
-    setIsActive(false);
-    setIsConnecting(false);
-  }, []);
+    setPhase('idle');
+  }, [setPhase]);
 
   useEffect(() => cleanup, [cleanup]);
 
@@ -71,13 +117,23 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
     onSettingsChange?.(newTuning);
   };
 
+  const handleVoiceModelChange = (id: string) => {
+    setLiveModel(id);
+    setLiveModelState(id);
+  };
+
   const startSession = async () => {
     const apiKey = getApiKey();
     if (!apiKey) {
       alert('No Gemini API key set. Close this screen and add one via the key button (free at aistudio.google.com/apikey).');
       return;
     }
-    setIsConnecting(true);
+    closingRef.current = false;
+    turnDoneRef.current = true;
+    setErrorMsg(null);
+    setUserTranscript('');
+    setModelTranscript('');
+    setPhase('connecting');
     const ai = new GoogleGenAI({ apiKey });
 
     try {
@@ -95,14 +151,13 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
       const inputRate = audioContextRef.current.sampleRate;
 
       const sessionPromise = ai.live.connect({
-        model: LIVE_MODEL,
+        model: liveModel,
         callbacks: {
           onopen: () => {
-            setIsConnecting(false);
-            setIsActive(true);
+            setPhase('listening');
             const source = audioContextRef.current!.createMediaStreamSource(stream);
             const scriptProcessor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
-            
+
             scriptProcessor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
               const resampledData = resample(inputData, inputRate, 16000);
@@ -125,38 +180,87 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
             scriptProcessor.connect(audioContextRef.current!.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            const outCtx = outputAudioContextRef.current;
-            if (base64Audio && outCtx) {
-              setIsSpeaking(true);
-              nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outCtx.currentTime);
-              
-              const audioBuffer = await decodeAudioData(decodePCM(base64Audio), outCtx, 24000, 1);
-              const source = outCtx.createBufferSource();
-              source.buffer = audioBuffer;
-              source.playbackRate.value = tuning.rate;
-              source.detune.value = (tuning.pitch - 1.0) * 1200;
+            const content = message.serverContent;
+            if (!content) return;
 
-              source.connect(outCtx.destination);
-              source.addEventListener('ended', () => {
-                sourcesRef.current.delete(source);
-                if (sourcesRef.current.size === 0) setIsSpeaking(false);
-              });
-
-              source.start(nextStartTimeRef.current);
-              nextStartTimeRef.current += audioBuffer.duration;
-              sourcesRef.current.add(source);
+            // Your words, as the server recognizes them — proof the prompt is arriving
+            if (content.inputTranscription?.text) {
+              if (turnDoneRef.current) {
+                turnDoneRef.current = false;
+                setUserTranscript('');
+                setModelTranscript('');
+              }
+              setUserTranscript(prev => prev + content.inputTranscription!.text);
+              if (phaseRef.current !== 'speaking') {
+                setPhase('listening');
+                // No explicit "user turn ended" event exists; a pause in recognized
+                // speech means the prompt is in and we're waiting on the model.
+                if (thinkTimerRef.current) clearTimeout(thinkTimerRef.current);
+                thinkTimerRef.current = setTimeout(() => {
+                  if (phaseRef.current === 'listening') setPhase('thinking');
+                }, 900);
+              }
             }
 
-            if (message.serverContent?.interrupted) {
+            if (content.outputTranscription?.text) {
+              setModelTranscript(prev => prev + content.outputTranscription!.text);
+            }
+
+            // A turn can carry several parts (e.g. text then audio) — take every audio part
+            const outCtx = outputAudioContextRef.current;
+            if (outCtx) {
+              for (const part of content.modelTurn?.parts || []) {
+                const base64Audio = part.inlineData?.data;
+                if (!base64Audio) continue;
+                if (thinkTimerRef.current) clearTimeout(thinkTimerRef.current);
+                setPhase('speaking');
+                nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outCtx.currentTime);
+
+                const audioBuffer = await decodeAudioData(decodePCM(base64Audio), outCtx, 24000, 1);
+                const source = outCtx.createBufferSource();
+                source.buffer = audioBuffer;
+                source.playbackRate.value = tuning.rate;
+                source.detune.value = (tuning.pitch - 1.0) * 1200;
+
+                source.connect(outCtx.destination);
+                source.addEventListener('ended', () => {
+                  sourcesRef.current.delete(source);
+                  if (sourcesRef.current.size === 0 && phaseRef.current === 'speaking') {
+                    setPhase('listening');
+                  }
+                });
+
+                source.start(nextStartTimeRef.current);
+                nextStartTimeRef.current += audioBuffer.duration;
+                sourcesRef.current.add(source);
+              }
+            }
+
+            if (content.turnComplete) {
+              turnDoneRef.current = true;
+              if (sourcesRef.current.size === 0 && phaseRef.current !== 'idle') {
+                setPhase('listening');
+              }
+            }
+
+            if (content.interrupted) {
               sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
               sourcesRef.current.clear();
               nextStartTimeRef.current = 0;
-              setIsSpeaking(false);
+              setPhase('listening');
             }
           },
-          onerror: (e) => console.error("Live Error:", e),
-          onclose: () => cleanup(),
+          onerror: (e: ErrorEvent) => {
+            console.error("Live Error:", e);
+            setErrorMsg(e?.message || 'Connection error');
+          },
+          onclose: (e: CloseEvent) => {
+            if (closingRef.current) return;
+            // Not initiated by us: the server dropped the session — say why
+            const detail = [e?.code && e.code !== 1000 ? `code ${e.code}` : '', e?.reason || ''].filter(Boolean).join(': ');
+            setErrorMsg(prev => prev || `Connection closed by the server${detail ? ` (${detail})` : ''}. This can happen when the model declines a persona — try another voice model in the settings (sliders icon), or edit the character.`);
+            cleanup();
+          },
         },
         config: {
           responseModalities: [Modality.AUDIO],
@@ -164,13 +268,15 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
             voiceConfig: { prebuiltVoiceConfig: { voiceName: character.voiceName } },
           },
           systemInstruction: buildSystemPrompt({ ...character, voiceSettings: tuning }),
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
         },
       });
 
       sessionRef.current = await sessionPromise;
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to start voice session", err);
-      setIsConnecting(false);
+      setErrorMsg(err?.message || 'Could not start the voice session.');
       cleanup();
     }
   };
@@ -189,7 +295,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
       const time = Date.now() / 1000;
       const centerX = w / 2;
       const centerY = h / 2;
-      
+
       const radiusBase = (window.innerWidth < 768 ? 40 : 60) + (tuning.pitch - 1.0) * 20;
       const radius = radiusBase + (isSpeaking ? Math.sin(time * 10) * 15 : 0) + (isActive ? Math.sin(time * 2) * 4 : 0);
 
@@ -214,24 +320,39 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
     return () => cancelAnimationFrame(animationFrame);
   }, [isSpeaking, isActive, tuning]);
 
+  const elapsed = Math.max(0, Math.round((nowTick - phaseSince) / 1000));
+
   return (
     <div className="fixed inset-0 z-50 safe-area flex flex-col bg-black/95 backdrop-blur-2xl animate-in fade-in duration-300">
-      <div className="relative flex-1 flex flex-col items-center justify-between p-6 md:p-8">
+      <div className="relative flex-1 flex flex-col items-center justify-between p-6 md:p-8 min-h-0">
         {/* Header Controls */}
         <div className="w-full flex justify-between items-center z-30">
            <button
             onClick={() => setShowTuning(!showTuning)}
+            title="Voice settings"
             className={`p-3 rounded-2xl transition-all ${showTuning ? 'bg-purple-600 text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}
           >
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg>
           </button>
           <button
             onClick={() => { cleanup(); onClose(); }}
+            title="Close voice"
             className="p-3 text-slate-400 hover:text-white hover:bg-slate-800 rounded-2xl transition-colors"
           >
             <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
           </button>
         </div>
+
+        {/* Error banner */}
+        {errorMsg && (
+          <div className="w-full max-w-lg mt-2 p-4 bg-red-500/10 border border-red-500/40 rounded-2xl text-red-300 text-xs leading-relaxed z-30 flex items-start gap-3">
+            <svg className="w-5 h-5 shrink-0 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+            <span className="flex-1">{errorMsg}</span>
+            <button onClick={() => setErrorMsg(null)} className="text-red-400 hover:text-white shrink-0">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+          </div>
+        )}
 
         {/* Character Info */}
         <div className={`text-center transition-all duration-500 z-10 ${showTuning ? 'opacity-20 scale-90 blur-sm' : ''}`}>
@@ -239,15 +360,36 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
             <img src={character.avatarUrl || `https://picsum.photos/seed/${character.name}/200/200`} alt={character.name} className="w-full h-full object-cover" />
           </div>
           <h2 className="text-2xl md:text-3xl font-outfit font-bold text-white mb-2">{character.name}</h2>
-          <div className="px-4 py-1.5 bg-purple-500/10 border border-purple-500/30 rounded-full text-[10px] text-purple-300 uppercase font-black tracking-widest inline-block">
-             Mood: {tuning.emotion}
+          <div className="flex flex-col items-center gap-2">
+            <div className="px-4 py-1.5 bg-purple-500/10 border border-purple-500/30 rounded-full text-[10px] text-purple-300 uppercase font-black tracking-widest inline-block">
+               Mood: {tuning.emotion}
+            </div>
+            {/* Live pipeline status — real events, not a generic spinner */}
+            {phase !== 'idle' && (
+              <div className="px-4 py-1.5 bg-slate-800/80 border border-slate-700 rounded-full text-[10px] uppercase font-black tracking-widest inline-flex items-center gap-2 text-slate-200">
+                <span className={`w-2 h-2 rounded-full ${phase === 'speaking' ? 'bg-pink-500' : phase === 'thinking' ? 'bg-amber-400 animate-pulse' : phase === 'connecting' ? 'bg-slate-400 animate-pulse' : 'bg-green-500'}`} />
+                {PHASE_LABELS[phase]}{(phase === 'thinking' || phase === 'connecting') ? ` · ${elapsed}s` : ''}
+              </div>
+            )}
           </div>
         </div>
 
         {/* Visualizer Area */}
-        <div className={`flex-1 w-full flex items-center justify-center transition-all duration-500 ${showTuning ? 'opacity-0 blur-md' : 'opacity-100'}`}>
+        <div className={`flex-1 w-full flex items-center justify-center transition-all duration-500 min-h-0 ${showTuning ? 'opacity-0 blur-md' : 'opacity-100'}`}>
           <canvas ref={canvasRef} width={400} height={400} className="w-full h-full max-w-[320px] md:max-w-none" />
         </div>
+
+        {/* Live transcript — what the server heard from you, and what the model said */}
+        {(userTranscript || modelTranscript) && !showTuning && (
+          <div className="w-full max-w-lg max-h-28 overflow-y-auto mb-4 p-4 bg-slate-900/70 border border-slate-800 rounded-2xl text-xs leading-relaxed space-y-2 z-20">
+            {userTranscript && (
+              <p className="text-slate-300"><span className="text-purple-400 font-bold uppercase text-[9px] tracking-widest mr-2">You</span>{userTranscript}</p>
+            )}
+            {modelTranscript && (
+              <p className="text-slate-300"><span className="text-pink-400 font-bold uppercase text-[9px] tracking-widest mr-2">{character.name}</span>{modelTranscript}</p>
+            )}
+          </div>
+        )}
 
         {/* Action Button */}
         <div className="w-full flex justify-center pb-8 z-30">
@@ -268,7 +410,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
             </button>
           ) : (
             <div className="text-purple-400 font-black tracking-[0.2em] animate-pulse text-sm">
-              LINKING NEURAL PATHWAYS...
+              CONNECTING — {elapsed}s
             </div>
           )}
         </div>
@@ -283,6 +425,25 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
                 </button>
              </div>
              <div className="space-y-6">
+                <div className="space-y-3">
+                  <div className="flex justify-between text-[10px] font-black text-slate-500 uppercase tracking-widest">
+                    <span>Voice Model</span>
+                    {isActive && <span className="text-amber-400 normal-case font-semibold">applies to the next call</span>}
+                  </div>
+                  <select
+                    value={liveModel}
+                    onChange={e => handleVoiceModelChange(e.target.value)}
+                    className="w-full bg-slate-900/70 border border-slate-700 rounded-2xl px-4 py-3 focus:ring-2 focus:ring-purple-500 outline-none transition-all appearance-none text-slate-300 text-base md:text-sm"
+                  >
+                    {voiceModels.map(m => (
+                      <option key={m.id} value={m.id} className="bg-slate-900">{m.label}</option>
+                    ))}
+                    {!voiceModels.some(m => m.id === liveModel) && (
+                      <option value={liveModel} className="bg-slate-900">{liveModel}</option>
+                    )}
+                  </select>
+                </div>
+
                 <div className="space-y-3">
                   <div className="flex justify-between text-[10px] font-black text-slate-500 uppercase tracking-widest">
                     <span>Active Overlay</span>
@@ -307,11 +468,11 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
                         <span>Frequency Range</span>
                         <span className="text-purple-400">{tuning.pitch.toFixed(1)}x</span>
                       </div>
-                      <input 
-                        type="range" min="0.5" max="1.5" step="0.1" 
-                        value={tuning.pitch} 
+                      <input
+                        type="range" min="0.5" max="1.5" step="0.1"
+                        value={tuning.pitch}
                         onChange={e => handleTuningChange('pitch', parseFloat(e.target.value))}
-                        className="w-full accent-purple-500 h-2 bg-slate-800 rounded-full appearance-none cursor-pointer" 
+                        className="w-full accent-purple-500 h-2 bg-slate-800 rounded-full appearance-none cursor-pointer"
                       />
                    </div>
                    <div className="space-y-3">
@@ -319,15 +480,15 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
                         <span>Tempo Velocity</span>
                         <span className="text-purple-400">{tuning.rate.toFixed(1)}x</span>
                       </div>
-                      <input 
-                        type="range" min="0.5" max="1.5" step="0.1" 
-                        value={tuning.rate} 
+                      <input
+                        type="range" min="0.5" max="1.5" step="0.1"
+                        value={tuning.rate}
                         onChange={e => handleTuningChange('rate', parseFloat(e.target.value))}
-                        className="w-full accent-purple-500 h-2 bg-slate-800 rounded-full appearance-none cursor-pointer" 
+                        className="w-full accent-purple-500 h-2 bg-slate-800 rounded-full appearance-none cursor-pointer"
                       />
                    </div>
                 </div>
-                
+
                 <p className="text-[9px] text-slate-500 italic text-center mt-4 uppercase tracking-tighter">Changes propagate to the next response cycle.</p>
              </div>
           </div>
