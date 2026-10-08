@@ -56,7 +56,7 @@ const AdvancedPersonalityEditor: React.FC<AdvancedPersonalityEditorProps> = ({ t
           <textarea
             value={dynamics}
             onChange={(e) => onChange('nuancedDynamics', e.target.value)}
-            className="w-full h-24 bg-slate-900/50 border border-slate-700 rounded-2xl px-4 py-3 focus:ring-2 focus:ring-purple-500 outline-none transition-all resize-none text-sm text-slate-300 placeholder:text-slate-600"
+            className="w-full h-24 bg-slate-900/50 border border-slate-700 rounded-2xl px-4 py-3 focus:ring-2 focus:ring-purple-500 outline-none transition-all resize-none text-base md:text-sm text-slate-300 placeholder:text-slate-600"
             placeholder="e.g., Hidden romantic tension beneath a cold exterior. Mutual respect but frequent intellectual sparring."
           />
         </div>
@@ -66,7 +66,7 @@ const AdvancedPersonalityEditor: React.FC<AdvancedPersonalityEditorProps> = ({ t
           <textarea
             value={triggers}
             onChange={(e) => onChange('behavioralTriggers', e.target.value)}
-            className="w-full h-24 bg-slate-900/50 border border-slate-700 rounded-2xl px-4 py-3 focus:ring-2 focus:ring-pink-500 outline-none transition-all resize-none text-sm text-slate-300 placeholder:text-slate-600"
+            className="w-full h-24 bg-slate-900/50 border border-slate-700 rounded-2xl px-4 py-3 focus:ring-2 focus:ring-pink-500 outline-none transition-all resize-none text-base md:text-sm text-slate-300 placeholder:text-slate-600"
             placeholder="e.g., Becomes protective if the user mentions being threatened. Softens their tone if the user is vulnerable."
           />
           <p className="text-[10px] text-slate-500 italic">Define specific events or user behaviors that shift the AI's internal state.</p>

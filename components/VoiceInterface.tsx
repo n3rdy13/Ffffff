@@ -3,7 +3,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { Character } from '../types';
 import { buildSystemPrompt, EMOTION_OPTIONS } from '../constants';
-import { decodeAudioData, decodePCM, encodePCM, getApiKey, LIVE_MODEL } from '../services/geminiService';
+import { decodeAudioData, decodePCM, encodePCM, getApiKey, LIVE_MODEL, setAudioSessionType } from '../services/geminiService';
 
 interface VoiceInterfaceProps {
   character: Character;
@@ -32,6 +32,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
   
   const audioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const micStreamRef = useRef<MediaStream | null>(null);
   const sessionRef = useRef<any>(null);
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
@@ -44,7 +45,12 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
     }
     sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
     sourcesRef.current.clear();
-    
+
+    if (micStreamRef.current) {
+      micStreamRef.current.getTracks().forEach(track => track.stop());
+      micStreamRef.current = null;
+    }
+
     if (audioContextRef.current) {
       audioContextRef.current.close().catch(console.error);
       audioContextRef.current = null;
@@ -56,6 +62,8 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
     setIsActive(false);
     setIsConnecting(false);
   }, []);
+
+  useEffect(() => cleanup, [cleanup]);
 
   const handleTuningChange = (key: keyof typeof tuning, value: any) => {
     const newTuning = { ...tuning, [key]: value };
@@ -73,9 +81,16 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
     const ai = new GoogleGenAI({ apiKey });
 
     try {
+      // Audio contexts must be created during the tap (before any await) or iOS keeps them suspended
+      setAudioSessionType('auto');
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      audioContextRef.current = new AudioContextClass();
+      outputAudioContextRef.current = new AudioContextClass({ sampleRate: 24000 });
+      audioContextRef.current.resume().catch(() => undefined);
+      outputAudioContextRef.current.resume().catch(() => undefined);
+
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
+      micStreamRef.current = stream;
 
       const inputRate = audioContextRef.current.sampleRate;
 
@@ -111,9 +126,9 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
           },
           onmessage: async (message: LiveServerMessage) => {
             const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (base64Audio) {
+            const outCtx = outputAudioContextRef.current;
+            if (base64Audio && outCtx) {
               setIsSpeaking(true);
-              const outCtx = outputAudioContextRef.current!;
               nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outCtx.currentTime);
               
               const audioBuffer = await decodeAudioData(decodePCM(base64Audio), outCtx, 24000, 1);
@@ -200,7 +215,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
   }, [isSpeaking, isActive, tuning]);
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col bg-black/95 backdrop-blur-2xl animate-in fade-in duration-300">
+    <div className="fixed inset-0 z-50 safe-area flex flex-col bg-black/95 backdrop-blur-2xl animate-in fade-in duration-300">
       <div className="relative flex-1 flex flex-col items-center justify-between p-6 md:p-8">
         {/* Header Controls */}
         <div className="w-full flex justify-between items-center z-30">

@@ -157,6 +157,25 @@ export const analyzeRelationship = async (character: Character, history: Message
   }
 };
 
+// Generated portraits are 1-2MB PNGs; avatars are saved in localStorage (~5MB
+// on Safari), so shrink them to a small JPEG before they are stored.
+const shrinkImage = (dataUrl: string, maxSize = 512): Promise<string> =>
+  new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.round(img.width * scale);
+      canvas.height = Math.round(img.height * scale);
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return resolve(dataUrl);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.85));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+
 export const generateCharacterImage = async (prompt: string): Promise<string | null> => {
   // Free-tier model first; Imagen needs a billing-enabled project, so it is
   // only tried as a fallback for keys that have access to it.
@@ -171,7 +190,7 @@ export const generateCharacterImage = async (prompt: string): Promise<string | n
 
     for (const part of response.candidates?.[0]?.content?.parts || []) {
       if (part.inlineData?.data) {
-        return `data:image/png;base64,${part.inlineData.data}`;
+        return shrinkImage(`data:${part.inlineData.mimeType || 'image/png'};base64,${part.inlineData.data}`);
       }
     }
     throw new Error('No image returned');
@@ -190,7 +209,7 @@ export const generateCharacterImage = async (prompt: string): Promise<string | n
 
       const base64EncodeString = response.generatedImages?.[0]?.image?.imageBytes;
       if (base64EncodeString) {
-        return `data:image/png;base64,${base64EncodeString}`;
+        return shrinkImage(`data:image/png;base64,${base64EncodeString}`);
       }
     } catch (innerError) {
       console.error("Fallback image generation also failed:", innerError);
@@ -283,7 +302,35 @@ export const generateVideo = async (character: Character, history: Message[], ca
   }
 };
 
+let playbackContext: AudioContext | null = null;
+
+// iOS only lets a page start audio from a user tap, and a context created after
+// an awaited network call stays silent. Call this synchronously from the tap.
+const getPlaybackContext = (): AudioContext => {
+  if (!playbackContext || playbackContext.state === 'closed') {
+    playbackContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+  }
+  if (playbackContext.state !== 'running') {
+    playbackContext.resume().catch(() => undefined);
+  }
+  return playbackContext;
+};
+
+// iOS 17+: 'playback' lets speech play even when the ringer switch is on silent;
+// 'auto' hands control back to Safari (needed before using the microphone).
+export const setAudioSessionType = (type: 'auto' | 'playback'): void => {
+  const session = (navigator as any).audioSession;
+  if (!session) return;
+  try {
+    session.type = type;
+  } catch {
+    // Older WebKit without this session type
+  }
+};
+
 export const speakText = async (text: string, character: Character): Promise<void> => {
+  setAudioSessionType('playback');
+  const audioContext = getPlaybackContext();
   try {
     const ai = getAIClient();
     const prompt = `[Mood: ${character.voiceSettings.emotion}, Character: ${character.name}, Bond: ${character.bondStatus}] Speak the following: ${text}`;
@@ -304,7 +351,6 @@ export const speakText = async (text: string, character: Character): Promise<voi
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (base64Audio) {
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
       const audioBuffer = await decodeAudioData(
         decodePCM(base64Audio),
         audioContext,
@@ -316,10 +362,12 @@ export const speakText = async (text: string, character: Character): Promise<voi
       source.playbackRate.value = character.voiceSettings.rate || 1.0;
       source.detune.value = (character.voiceSettings.pitch - 1.0) * 1200;
       source.connect(audioContext.destination);
-      source.start();
-      source.onended = () => {
-        setTimeout(() => audioContext.close(), 1000);
-      };
+      await new Promise<void>(resolve => {
+        source.onended = () => resolve();
+        // 'ended' never fires if iOS keeps the context suspended; don't leave the UI stuck
+        setTimeout(resolve, (audioBuffer.duration / source.playbackRate.value) * 1000 + 1000);
+        source.start();
+      });
     }
   } catch (error) {
     console.error("TTS generation failed:", error);

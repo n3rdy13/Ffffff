@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
 import { Character, Message, Relationship } from './types';
 import { DEFAULT_CHARACTERS, DISCOVER_CHARACTERS, getBondDescription, REASSURING_VIDEO_MESSAGES } from './constants';
 import CharacterCreator from './components/CharacterCreator';
@@ -15,16 +15,29 @@ interface SavedChat {
   bondStatus: string;
 }
 
-const App: React.FC = () => {
-  const [characters, setCharacters] = useState<Character[]>(() => {
-    const saved = localStorage.getItem('persona_characters');
-    return saved ? JSON.parse(saved) : DEFAULT_CHARACTERS;
-  });
+const loadStored = <T,>(key: string, fallback: T): T => {
+  try {
+    const saved = localStorage.getItem(key);
+    return saved ? JSON.parse(saved) : fallback;
+  } catch (error) {
+    console.error(`Could not read ${key}:`, error);
+    return fallback;
+  }
+};
 
-  const [savedChats, setSavedChats] = useState<SavedChat[]>(() => {
-    const saved = localStorage.getItem('persona_saved_chats');
-    return saved ? JSON.parse(saved) : [];
-  });
+// Safari caps localStorage at ~5MB; a failed write must not crash the app.
+const persist = (key: string, value: unknown) => {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch (error) {
+    console.error(`Could not save ${key} (storage full?):`, error);
+  }
+};
+
+const App: React.FC = () => {
+  const [characters, setCharacters] = useState<Character[]>(() => loadStored('persona_characters', DEFAULT_CHARACTERS));
+
+  const [savedChats, setSavedChats] = useState<SavedChat[]>(() => loadStored('persona_saved_chats', []));
   
   const [activeCharacter, setActiveCharacter] = useState<Character | null>(null);
   const [isCreating, setIsCreating] = useState(false);
@@ -49,6 +62,7 @@ const App: React.FC = () => {
   const [isVideoGenerating, setIsVideoGenerating] = useState(false);
   const [videoMessageIndex, setVideoMessageIndex] = useState(0);
   const [generatedVideoUrl, setGeneratedVideoUrl] = useState<string | null>(null);
+  const [showVideo, setShowVideo] = useState(false);
 
   // Camera State
   const [isCameraActive, setIsCameraActive] = useState(false);
@@ -59,11 +73,11 @@ const App: React.FC = () => {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    localStorage.setItem('persona_characters', JSON.stringify(characters));
+    persist('persona_characters', characters);
   }, [characters]);
 
   useEffect(() => {
-    localStorage.setItem('persona_saved_chats', JSON.stringify(savedChats));
+    persist('persona_saved_chats', savedChats);
   }, [savedChats]);
 
   useEffect(() => {
@@ -91,21 +105,31 @@ const App: React.FC = () => {
     };
   }, [cameraStream]);
 
+  // Release the camera when leaving the chat so the device's camera indicator turns off
+  useEffect(() => {
+    if (!activeCharacter && cameraStream) {
+      setCameraStream(null);
+      setIsCameraActive(false);
+    }
+  }, [activeCharacter]);
+
+  // The preview <video> only mounts after the camera turns on, so attach the stream when it does
+  const attachCameraPreview = useCallback((el: HTMLVideoElement | null) => {
+    videoRef.current = el;
+    if (el && cameraStream) {
+      el.srcObject = cameraStream;
+    }
+  }, [cameraStream]);
+
   const handleToggleCamera = async () => {
     if (isCameraActive) {
-      if (cameraStream) {
-        cameraStream.getTracks().forEach(track => track.stop());
-      }
       setCameraStream(null);
       setIsCameraActive(false);
     } else {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
         setCameraStream(stream);
         setIsCameraActive(true);
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
       } catch (err) {
         console.error("Camera access denied:", err);
         alert("Camera access is required for this feature.");
@@ -166,13 +190,24 @@ const App: React.FC = () => {
       content += `[${time}] ${speaker}: ${m.text}\n\n`;
     });
 
-    const blob = new Blob([content], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
+    const fileName = `PersonaX_${activeCharacter.name}_${Date.now()}.txt`;
+    const file = new File([content], fileName, { type: 'text/plain' });
+
+    // On phones, downloads from a home-screen web app are unreliable; use the share sheet ("Save to Files")
+    const isTouchDevice = window.matchMedia('(pointer: coarse)').matches;
+    if (isTouchDevice && navigator.canShare?.({ files: [file] })) {
+      navigator.share({ files: [file], title: `Chat with ${activeCharacter.name}` }).catch(err => {
+        if (err?.name !== 'AbortError') console.error('Share failed:', err);
+      });
+      return;
+    }
+
+    const url = URL.createObjectURL(file);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `PersonaX_${activeCharacter.name}_${Date.now()}.txt`;
+    link.download = fileName;
     link.click();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   const handleViewSavedChat = (chat: SavedChat) => {
@@ -379,7 +414,7 @@ const App: React.FC = () => {
   }, [discoverFilter, discoverSort]);
 
   return (
-    <div className="flex h-screen bg-[#030712] overflow-hidden">
+    <div className="app-shell safe-area flex bg-[#030712] overflow-hidden">
       {/* Sidebar - Hidden on mobile */}
       <aside className="hidden md:flex w-80 flex-col border-r border-slate-800 glass-panel">
         <div className="p-6 border-b border-slate-800 flex items-center justify-between">
@@ -483,7 +518,7 @@ const App: React.FC = () => {
       </aside>
 
       {/* Main Content */}
-      <main className={`flex-1 flex flex-col relative transition-all duration-300 ${!activeCharacter ? 'pb-24 md:pb-0' : ''}`}>
+      <main className={`flex-1 min-w-0 flex flex-col relative transition-all duration-300 ${!activeCharacter ? 'pb-24 md:pb-0' : ''}`}>
         {activeCharacter ? (
           <>
             {/* Chat Header */}
@@ -538,8 +573,8 @@ const App: React.FC = () => {
             {/* Chat Area */}
             <div ref={scrollRef} className="flex-1 overflow-y-auto p-4 md:p-6 space-y-4 md:space-y-6 bg-fixed opacity-90 relative">
               {isCameraActive && (
-                <div className="fixed top-20 right-4 w-28 h-20 md:w-32 md:h-24 rounded-xl overflow-hidden border border-slate-700 shadow-2xl z-20 bg-black">
-                  <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+                <div className="fixed safe-camera-preview right-4 w-28 h-20 md:w-32 md:h-24 rounded-xl overflow-hidden border border-slate-700 shadow-2xl z-20 bg-black">
+                  <video ref={attachCameraPreview} autoPlay playsInline muted className="w-full h-full object-cover" />
                 </div>
               )}
 
@@ -594,14 +629,13 @@ const App: React.FC = () => {
                    )}
                  </button>
                  {generatedVideoUrl && (
-                   <a 
-                    href={generatedVideoUrl} 
-                    target="_blank" 
-                    rel="noreferrer"
+                   <button
+                    type="button"
+                    onClick={() => setShowVideo(true)}
                     className="whitespace-nowrap flex-none px-4 py-2 bg-slate-800 text-white text-[10px] font-bold rounded-xl flex items-center justify-center gap-2"
                    >
                      View Video
-                   </a>
+                   </button>
                  )}
               </div>
               <form onSubmit={handleSendMessage} className="flex items-center gap-2 bg-slate-900/80 border border-slate-700 rounded-2xl px-3 md:px-4 py-0.5 md:py-1 focus-within:ring-2 focus-within:ring-purple-500">
@@ -682,7 +716,7 @@ const App: React.FC = () => {
 
         {/* Mobile Bottom Navigation */}
         {!activeCharacter && (
-          <nav className="fixed bottom-6 left-1/2 -translate-x-1/2 w-[90%] max-sm h-16 glass-panel rounded-full border border-slate-700 shadow-[0_20px_50px_rgba(0,0,0,0.5)] flex items-center justify-around px-2 z-40 md:hidden">
+          <nav className="fixed safe-bottom-nav left-1/2 -translate-x-1/2 w-[90%] max-w-sm h-16 glass-panel rounded-full border border-slate-700 shadow-[0_20px_50px_rgba(0,0,0,0.5)] flex items-center justify-around px-2 z-40 md:hidden">
             <button onClick={() => setView('my')} className={`flex flex-col items-center gap-1 transition-all px-4 py-2 rounded-full ${view === 'my' ? 'bg-purple-600/20 text-purple-400' : 'text-slate-500'}`}>
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197" /></svg>
               <span className="text-[8px] font-bold uppercase tracking-widest">Bonds</span>
@@ -703,6 +737,26 @@ const App: React.FC = () => {
         )}
       </main>
 
+      {/* Video Player — played inline because blob URLs can't open in a new tab from a home-screen app */}
+      {showVideo && generatedVideoUrl && (
+        <div className="fixed inset-0 z-[60] safe-area flex flex-col items-center justify-center gap-4 bg-black/95 p-4" onClick={() => setShowVideo(false)}>
+          <video
+            src={generatedVideoUrl}
+            controls
+            autoPlay
+            playsInline
+            className="w-full max-w-3xl max-h-[75vh] rounded-2xl bg-black"
+            onClick={e => e.stopPropagation()}
+          />
+          <button
+            onClick={() => setShowVideo(false)}
+            className="px-8 py-3 bg-slate-800 hover:bg-slate-700 text-white font-bold rounded-xl text-xs uppercase tracking-widest"
+          >
+            Close
+          </button>
+        </div>
+      )}
+
       {/* API Key Modal */}
       {showKeyModal && (
         <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
@@ -721,7 +775,7 @@ const App: React.FC = () => {
               onChange={e => setKeyInput(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') handleSaveApiKey(); }}
               placeholder={hasApiKey() ? 'Key already set — paste to replace' : 'AIza...'}
-              className="w-full bg-slate-900/70 border border-slate-700 rounded-2xl px-5 py-4 mb-4 focus:ring-2 focus:ring-purple-500 outline-none transition-all text-white placeholder:text-slate-600 text-sm font-mono"
+              className="w-full bg-slate-900/70 border border-slate-700 rounded-2xl px-5 py-4 mb-4 focus:ring-2 focus:ring-purple-500 outline-none transition-all text-white placeholder:text-slate-600 text-base md:text-sm font-mono"
               autoFocus
             />
             <div className="flex gap-3">
@@ -745,7 +799,7 @@ const App: React.FC = () => {
 
       {/* Creation/Edit Modal */}
       {isCreating && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm overflow-hidden">
+        <div className="fixed inset-0 z-50 safe-area flex items-center justify-center bg-black/60 backdrop-blur-sm overflow-hidden">
           <CharacterCreator 
             onSave={saveCharacter} 
             onCancel={() => setIsCreating(false)} 

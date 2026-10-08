@@ -8,6 +8,30 @@ This contains everything you need to run your app locally.
 
 View your app in AI Studio: https://ai.studio/apps/220daf3c-c8b7-49b6-aa77-e833d03ed155
 
+## Use it on your iPhone
+
+PersonaX is an installable web app, hosted for free on GitHub Pages at
+**https://n3rdy13.github.io/Ffffff/**
+
+**One-time setup (on GitHub):** go to the repo's **Settings → Pages**, under
+*Build and deployment* set **Source** to *Deploy from a branch*, pick the
+**`gh-pages`** branch and **`/ (root)`**, and save. The site is live a minute later.
+After that, every push to `main` rebuilds and redeploys it automatically
+(`.github/workflows/deploy.yml`).
+
+**On the iPhone:**
+1. Open the link above in **Safari**.
+2. Tap the **Share** button → **Add to Home Screen** → **Add**.
+3. Launch **PersonaX** from the home screen (it opens full-screen, like a native app)
+   and paste your Gemini API key when asked.
+
+The home-screen app keeps its own storage, separate from Safari, so enter the
+key inside the installed app. Your key, characters, and chats stay on the
+phone; nothing is sent anywhere except to Google's Gemini API.
+
+> Never set `GEMINI_API_KEY` for the GitHub build: a key present at build time
+> is baked into the public site.
+
 ## Run Locally
 
 **Prerequisites:**  Node.js

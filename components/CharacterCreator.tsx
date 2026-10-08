@@ -159,36 +159,38 @@ const CharacterCreator: React.FC<CharacterCreatorProps> = ({ onSave, onCancel, i
 
   return (
     <div className="w-full h-full md:w-auto md:h-auto md:max-w-4xl md:mx-auto glass-panel md:p-8 md:rounded-[2.5rem] animate-in fade-in zoom-in duration-300 shadow-2xl overflow-y-auto max-h-screen md:max-h-[90vh] border border-slate-700/50 flex flex-col">
-      <div className="sticky top-0 bg-[#030712]/80 backdrop-blur-md z-30 p-5 md:p-0 flex justify-between items-center mb-0 md:mb-8 border-b border-slate-800 md:border-none">
-        <div className="flex flex-col">
-          <h2 className="text-2xl md:text-3xl font-outfit font-black text-transparent bg-clip-text bg-gradient-to-r from-purple-400 via-pink-400 to-rose-500">
-            {initialCharacter ? 'Refine Companion' : 'Forge New Companion'}
-          </h2>
-          <p className="text-slate-500 text-[10px] md:text-xs font-semibold tracking-widest mt-1 uppercase">Sculpting consciousness</p>
+      <div className="sticky top-0 z-30 flex-shrink-0 bg-[#030712]/80 backdrop-blur-md md:static md:bg-transparent md:backdrop-blur-none">
+        <div className="p-5 md:p-0 flex justify-between items-center mb-0 md:mb-8 border-b border-slate-800 md:border-none">
+          <div className="flex flex-col">
+            <h2 className="text-2xl md:text-3xl font-outfit font-black text-transparent bg-clip-text bg-gradient-to-r from-purple-400 via-pink-400 to-rose-500">
+              {initialCharacter ? 'Refine Companion' : 'Forge New Companion'}
+            </h2>
+            <p className="text-slate-500 text-[10px] md:text-xs font-semibold tracking-widest mt-1 uppercase">Sculpting consciousness</p>
+          </div>
+          {formData.avatarUrl ? (
+            <img src={formData.avatarUrl} className="w-12 h-12 md:w-20 md:h-20 rounded-xl md:rounded-3xl border-2 border-purple-500/50 object-cover shadow-2xl rotate-3" alt="Preview" />
+          ) : (
+            <button onClick={onCancel} className="p-2 text-slate-400 md:hidden">
+              <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+            </button>
+          )}
         </div>
-        {formData.avatarUrl ? (
-          <img src={formData.avatarUrl} className="w-12 h-12 md:w-20 md:h-20 rounded-xl md:rounded-3xl border-2 border-purple-500/50 object-cover shadow-2xl rotate-3" alt="Preview" />
-        ) : (
-          <button onClick={onCancel} className="p-2 text-slate-400 md:hidden">
-            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-          </button>
-        )}
+
+        <div className="flex gap-1 p-2 md:p-0 md:mb-8 border-b border-slate-800/50 overflow-x-auto whitespace-nowrap scrollbar-none">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => setActiveTab(tab.id as any)}
+              className={`flex-none px-4 py-2.5 md:px-5 md:py-2 rounded-xl transition-all font-bold text-[10px] md:text-xs uppercase tracking-widest ${activeTab === tab.id ? 'bg-purple-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800/50'}`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
       </div>
 
-      <div className="sticky top-[72px] md:top-0 bg-[#030712]/80 backdrop-blur-md z-20 flex gap-1 p-2 md:p-0 md:mb-8 border-b border-slate-800/50 overflow-x-auto whitespace-nowrap scrollbar-none">
-        {tabs.map((tab) => (
-          <button
-            key={tab.id}
-            type="button"
-            onClick={() => setActiveTab(tab.id as any)}
-            className={`flex-none px-4 py-2.5 md:px-5 md:py-2 rounded-xl transition-all font-bold text-[10px] md:text-xs uppercase tracking-widest ${activeTab === tab.id ? 'bg-purple-600 text-white shadow-lg' : 'text-slate-500 hover:text-slate-300 hover:bg-slate-800/50'}`}
-          >
-            {tab.label}
-          </button>
-        ))}
-      </div>
-
-      <form onSubmit={handleSubmit} className="flex-1 p-5 md:p-0 space-y-6 md:space-y-8 pb-32 md:pb-0">
+      <form onSubmit={handleSubmit} className="flex-1 p-5 md:p-0 space-y-6 md:space-y-8 pb-0">
         {activeTab === 'basic' && (
           <div className="space-y-6 animate-in fade-in slide-in-from-left-4 duration-300">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -461,7 +463,7 @@ const CharacterCreator: React.FC<CharacterCreatorProps> = ({ onSave, onCancel, i
           </button>
         </div>
 
-        <div className="fixed bottom-0 inset-x-0 md:static p-5 md:p-0 bg-gradient-to-t from-[#030712] via-[#030712] to-transparent md:bg-none z-40 md:z-auto">
+        <div className="sticky bottom-0 -mx-5 md:mx-0 md:static p-5 md:p-0 safe-mobile-footer bg-gradient-to-t from-[#030712] via-[#030712] to-transparent md:bg-none z-40 md:z-auto">
           <div className="flex flex-col sm:flex-row gap-3 md:gap-4 md:pt-6 md:border-t md:border-slate-800">
             <div className="flex gap-2 w-full">
               <button
