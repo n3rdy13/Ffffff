@@ -32,6 +32,16 @@ function resample(data: Float32Array, fromRate: number, toRate: number): Float32
   return result;
 }
 
+const BARGE_IN_STORAGE = 'personax_voice_bargein';
+
+const readBargeIn = (): boolean => {
+  try {
+    return localStorage.getItem(BARGE_IN_STORAGE) === 'true';
+  } catch {
+    return false;
+  }
+};
+
 const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onSettingsChange }) => {
   const [phase, setPhaseState] = useState<Phase>('idle');
   const [phaseSince, setPhaseSince] = useState(Date.now());
@@ -44,6 +54,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
   const [tuning, setTuning] = useState(character.voiceSettings);
   const [voiceModels, setVoiceModels] = useState<ModelOption[]>([{ id: getLiveModel(), label: getLiveModel() }]);
   const [liveModel, setLiveModelState] = useState(getLiveModel());
+  const [bargeIn, setBargeIn] = useState(readBargeIn);
 
   const audioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
@@ -56,6 +67,9 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
   const closingRef = useRef(false);
   const thinkTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const turnDoneRef = useRef(true);
+  const bargeInRef = useRef(bargeIn);
+  const muteUntilRef = useRef(0);        // mic stays silenced to the server until this time
+  const discardTurnRef = useRef(false);  // drop the rest of the current turn's audio after a manual interrupt
 
   const isActive = phase === 'listening' || phase === 'thinking' || phase === 'speaking';
   const isConnecting = phase === 'connecting';
@@ -122,6 +136,27 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
     setLiveModelState(id);
   };
 
+  const handleBargeInChange = (value: boolean) => {
+    setBargeIn(value);
+    bargeInRef.current = value;
+    try {
+      localStorage.setItem(BARGE_IN_STORAGE, String(value));
+    } catch {
+      // preference lasts only this page load
+    }
+  };
+
+  // Stop the current reply locally and ignore the rest of its audio; the mic
+  // reopens immediately so the next thing you say starts a fresh turn.
+  const handleInterrupt = () => {
+    discardTurnRef.current = true;
+    sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
+    sourcesRef.current.clear();
+    nextStartTimeRef.current = 0;
+    muteUntilRef.current = Date.now() + 200;
+    setPhase('listening');
+  };
+
   const startSession = async () => {
     const apiKey = getApiKey();
     if (!apiKey) {
@@ -145,7 +180,11 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
       audioContextRef.current.resume().catch(() => undefined);
       outputAudioContextRef.current.resume().catch(() => undefined);
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      // Echo cancellation matters here: without it the mic hears the reply
+      // from the speaker and the server's voice detection cuts the reply off.
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
       micStreamRef.current = stream;
 
       const inputRate = audioContextRef.current.sampleRate;
@@ -163,8 +202,14 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
               const resampledData = resample(inputData, inputRate, 16000);
               const l = resampledData.length;
               const int16 = new Int16Array(l);
-              for (let i = 0; i < l; i++) {
-                int16[i] = resampledData[i] * 32768;
+              // Unless interruptions are enabled, send silence while the reply
+              // is playing (plus a short tail) so the speaker's echo can never
+              // read as "the user started talking" and cut the reply off.
+              const replyPlaying = sourcesRef.current.size > 0 || Date.now() < muteUntilRef.current;
+              if (!(replyPlaying && !bargeInRef.current)) {
+                for (let i = 0; i < l; i++) {
+                  int16[i] = resampledData[i] * 32768;
+                }
               }
               const pcmBlob = {
                 data: encodePCM(new Uint8Array(int16.buffer)),
@@ -212,6 +257,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
               for (const part of content.modelTurn?.parts || []) {
                 const base64Audio = part.inlineData?.data;
                 if (!base64Audio) continue;
+                if (discardTurnRef.current) continue; // manually interrupted — skip the rest of this turn
                 if (thinkTimerRef.current) clearTimeout(thinkTimerRef.current);
                 setPhase('speaking');
                 nextStartTimeRef.current = Math.max(nextStartTimeRef.current, outCtx.currentTime);
@@ -225,8 +271,11 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
                 source.connect(outCtx.destination);
                 source.addEventListener('ended', () => {
                   sourcesRef.current.delete(source);
-                  if (sourcesRef.current.size === 0 && phaseRef.current === 'speaking') {
-                    setPhase('listening');
+                  if (sourcesRef.current.size === 0) {
+                    // Keep the mic silenced briefly so the reply's tail echo
+                    // doesn't register as speech.
+                    muteUntilRef.current = Date.now() + 400;
+                    if (phaseRef.current === 'speaking') setPhase('listening');
                   }
                 });
 
@@ -238,6 +287,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
 
             if (content.turnComplete) {
               turnDoneRef.current = true;
+              discardTurnRef.current = false;
               if (sourcesRef.current.size === 0 && phaseRef.current !== 'idle') {
                 setPhase('listening');
               }
@@ -247,6 +297,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
               sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
               sourcesRef.current.clear();
               nextStartTimeRef.current = 0;
+              discardTurnRef.current = false;
               setPhase('listening');
             }
           },
@@ -270,6 +321,14 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
           systemInstruction: buildSystemPrompt({ ...character, voiceSettings: tuning }),
           inputAudioTranscription: {},
           outputAudioTranscription: {},
+          realtimeInputConfig: {
+            automaticActivityDetection: {
+              // Require ~a third of a second of sustained speech before the
+              // server counts it as you talking — stray noise and echo
+              // fragments no longer cut the reply off.
+              prefixPaddingMs: 300,
+            },
+          },
         },
       });
 
@@ -402,12 +461,22 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
               <div className="absolute inset-0 rounded-full border-2 border-white/20 animate-ping" />
             </button>
           ) : isActive ? (
-            <button
-              onClick={() => { cleanup(); }}
-              className="px-8 py-4 bg-red-500/20 hover:bg-red-500/40 text-red-400 border border-red-500/50 rounded-full font-black uppercase tracking-widest text-xs transition-all"
-            >
-              End Call
-            </button>
+            <div className="flex items-center gap-3">
+              {isSpeaking && (
+                <button
+                  onClick={handleInterrupt}
+                  className="px-6 py-4 bg-amber-500/20 hover:bg-amber-500/40 text-amber-400 border border-amber-500/50 rounded-full font-black uppercase tracking-widest text-xs transition-all"
+                >
+                  Interrupt
+                </button>
+              )}
+              <button
+                onClick={() => { cleanup(); }}
+                className="px-8 py-4 bg-red-500/20 hover:bg-red-500/40 text-red-400 border border-red-500/50 rounded-full font-black uppercase tracking-widest text-xs transition-all"
+              >
+                End Call
+              </button>
+            </div>
           ) : (
             <div className="text-purple-400 font-black tracking-[0.2em] animate-pulse text-sm">
               CONNECTING — {elapsed}s
@@ -442,6 +511,24 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
                       <option value={liveModel} className="bg-slate-900">{liveModel}</option>
                     )}
                   </select>
+                </div>
+
+                <div className="flex items-center justify-between gap-4 p-4 bg-slate-900/50 border border-slate-800 rounded-2xl">
+                  <div className="flex-1">
+                    <div className="text-[10px] font-black text-slate-300 uppercase tracking-widest">Voice Interruptions</div>
+                    <p className="text-[9px] text-slate-500 mt-1 leading-relaxed normal-case">
+                      Off: replies always finish, and you interrupt with the button. On: talking over a reply cuts it off — on speakerphone the mic can mistake the reply's echo for you.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={bargeIn}
+                    onClick={() => handleBargeInChange(!bargeIn)}
+                    className={`flex-none w-12 h-6 rounded-full transition-all relative flex items-center px-0.5 ${bargeIn ? 'bg-purple-600' : 'bg-slate-700'}`}
+                  >
+                    <div className={`w-5 h-5 bg-white rounded-full transition-all shadow ${bargeIn ? 'translate-x-6' : 'translate-x-0'}`} />
+                  </button>
                 </div>
 
                 <div className="space-y-3">

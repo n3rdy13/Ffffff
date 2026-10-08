@@ -70,6 +70,10 @@ const App: React.FC = () => {
   const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
   const [ttsStage, setTtsStage] = useState<TtsStage | null>(null);
 
+  // Response editing
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState('');
+
   // API Key State
   const [showKeyModal, setShowKeyModal] = useState(() => !hasApiKey());
   const [keyInput, setKeyInput] = useState('');
@@ -361,6 +365,30 @@ const App: React.FC = () => {
     && !!lastMessage
     && (lastMessage.role === 'model' || lastMessage.role === 'system')
     && messages.some(m => m.role === 'user');
+
+  const startEdit = (msg: Message) => {
+    if (isTyping || speakingMsgId) return;
+    setEditingMsgId(msg.id);
+    setEditDraft(msg.text);
+  };
+
+  const cancelEdit = () => {
+    setEditingMsgId(null);
+    setEditDraft('');
+  };
+
+  const saveEdit = () => {
+    const text = editDraft.trim();
+    if (!editingMsgId || !text) return;
+    const updated = messages.map(m => m.id === editingMsgId ? { ...m, text } : m);
+    setMessages(updated);
+    // Rebuild the session on the edited history so the model's memory of the
+    // conversation matches what's on screen.
+    if (activeCharacter && chatRef.current) {
+      initChat(activeCharacter, updated);
+    }
+    cancelEdit();
+  };
 
   const handleSpeakMessage = async (msgId: string, text: string) => {
     if (!activeCharacter || speakingMsgId) return;
@@ -668,7 +696,33 @@ const App: React.FC = () => {
                         )}
                       </div>
                   ) : (
-                    <div className={`max-w-[90%] md:max-w-[85%] rounded-2xl p-3.5 md:p-4 ${msg.role === 'user' ? 'bg-purple-600 text-white rounded-tr-none' : 'glass-panel text-slate-200 border-l-4 border-l-pink-500 rounded-tl-none shadow-xl'}`}>
+                    <div className={`max-w-[90%] md:max-w-[85%] rounded-2xl p-3.5 md:p-4 ${msg.role === 'user' ? 'bg-purple-600 text-white rounded-tr-none' : 'glass-panel text-slate-200 border-l-4 border-l-pink-500 rounded-tl-none shadow-xl'} ${editingMsgId === msg.id ? 'w-full' : ''}`}>
+                        {editingMsgId === msg.id ? (
+                          <div className="space-y-3">
+                            <textarea
+                              value={editDraft}
+                              onChange={e => setEditDraft(e.target.value)}
+                              autoFocus
+                              className="w-full min-h-28 bg-slate-900/70 border border-slate-700 rounded-xl px-4 py-3 focus:ring-2 focus:ring-purple-500 outline-none resize-y text-base md:text-sm text-slate-200 leading-relaxed"
+                            />
+                            <div className="flex justify-end gap-2">
+                              <button
+                                onClick={cancelEdit}
+                                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] font-bold uppercase tracking-widest rounded-lg transition-all"
+                              >
+                                Cancel
+                              </button>
+                              <button
+                                onClick={saveEdit}
+                                disabled={!editDraft.trim()}
+                                className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white text-[10px] font-bold uppercase tracking-widest rounded-lg transition-all disabled:opacity-40"
+                              >
+                                Save
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                        <>
                         <p className="text-sm md:text-base leading-relaxed whitespace-pre-wrap">{msg.text}</p>
                         <div className="flex items-center justify-between mt-2 gap-3">
                           <div className="text-[10px] opacity-40">{new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
@@ -696,6 +750,9 @@ const App: React.FC = () => {
                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
                                   </button>
                                 )}
+                                <button onClick={() => startEdit(msg)} title="Edit response" className="p-1 text-slate-500 hover:text-purple-400 transition-colors">
+                                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" /></svg>
+                                </button>
                                 <button onClick={() => handleSpeakMessage(msg.id, msg.text)} title="Play audio" className="p-1 text-slate-500 hover:text-pink-400 transition-colors">
                                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" /></svg>
                                 </button>
@@ -703,6 +760,8 @@ const App: React.FC = () => {
                             )
                           )}
                         </div>
+                        </>
+                        )}
                     </div>
                   )}
                 </div>
