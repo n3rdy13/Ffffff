@@ -25,6 +25,21 @@ const loadStored = <T,>(key: string, fallback: T): T => {
   }
 };
 
+// SDK errors often carry a raw JSON body; show the human message inside it.
+const humanizeError = (raw: string): string => {
+  const jsonStart = raw.indexOf('{');
+  if (jsonStart >= 0) {
+    try {
+      const parsed = JSON.parse(raw.slice(jsonStart));
+      const msg = parsed?.error?.message || parsed?.message;
+      if (typeof msg === 'string' && msg) return msg;
+    } catch {
+      // not JSON — fall through to the raw text
+    }
+  }
+  return raw;
+};
+
 // Safari caps localStorage at ~5MB; a failed write must not crash the app.
 const persist = (key: string, value: unknown) => {
   try {
@@ -309,7 +324,7 @@ const App: React.FC = () => {
       }
     } catch (error: any) {
       console.error("Chat Error:", error);
-      const errText = error?.message || 'Something went wrong. Please try again.';
+      const errText = humanizeError(error?.message || 'Something went wrong. Please try again.');
       setMessages(prev => [...prev, {
         id: (Date.now() + 2).toString(),
         role: 'system',
