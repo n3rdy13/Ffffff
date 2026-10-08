@@ -4,7 +4,7 @@ import { Character, Message, Relationship } from './types';
 import { DEFAULT_CHARACTERS, DISCOVER_CHARACTERS, getBondDescription, REASSURING_VIDEO_MESSAGES } from './constants';
 import CharacterCreator from './components/CharacterCreator';
 import VoiceInterface from './components/VoiceInterface';
-import { startTextChat, summarizeMemory, analyzeRelationship, generateVideo, speakText } from './services/geminiService';
+import { startTextChat, summarizeMemory, analyzeRelationship, generateVideo, speakText, hasApiKey, saveApiKey } from './services/geminiService';
 
 interface SavedChat {
   id: string;
@@ -40,6 +40,10 @@ const App: React.FC = () => {
 
   // TTS State
   const [speakingMsgId, setSpeakingMsgId] = useState<string | null>(null);
+
+  // API Key State
+  const [showKeyModal, setShowKeyModal] = useState(() => !hasApiKey());
+  const [keyInput, setKeyInput] = useState('');
 
   // Video Generation States
   const [isVideoGenerating, setIsVideoGenerating] = useState(false);
@@ -109,12 +113,34 @@ const App: React.FC = () => {
     }
   };
 
+  const initChat = (char: Character) => {
+    try {
+      chatRef.current = startTextChat(char);
+    } catch (error) {
+      console.error("Could not start chat:", error);
+      chatRef.current = null;
+      setShowKeyModal(true);
+    }
+  };
+
+  const handleSaveApiKey = () => {
+    const key = keyInput.trim();
+    if (!key) return;
+    saveApiKey(key);
+    setKeyInput('');
+    setShowKeyModal(false);
+    // Re-initialize the active chat now that a key is available
+    if (activeCharacter && !chatRef.current) {
+      initChat(activeCharacter);
+    }
+  };
+
   const handleSelectCharacter = (char: Character) => {
     setActiveCharacter(char);
     setMessages([]);
     setGeneratedVideoUrl(null);
-    chatRef.current = startTextChat(char);
-    
+    initChat(char);
+
     setMessages([{
       id: 'init',
       role: 'model',
@@ -182,6 +208,7 @@ const App: React.FC = () => {
     const textToSend = customPrompt || inputText;
     if (!textToSend.trim() || !chatRef.current || isTyping || !activeCharacter) return;
 
+    const sentMessages: Message[] = [];
     if (!customPrompt) {
         const userMessage: Message = {
           id: Date.now().toString(),
@@ -189,9 +216,10 @@ const App: React.FC = () => {
           text: textToSend,
           timestamp: Date.now()
         };
+        sentMessages.push(userMessage);
         setMessages(prev => [...prev, userMessage]);
     }
-    
+
     setInputText('');
     setIsTyping(true);
 
@@ -203,8 +231,8 @@ const App: React.FC = () => {
         text: response.text || "I'm sorry, I couldn't process that.",
         timestamp: Date.now()
       };
-      
-      const updatedHistory = [...messages, aiMessage];
+
+      const updatedHistory = [...messages, ...sentMessages, aiMessage];
       setMessages(prev => [...prev, aiMessage]);
 
       if (updatedHistory.length > 0 && updatedHistory.length % 6 === 0) {
@@ -222,8 +250,18 @@ const App: React.FC = () => {
           updateCharacterInList(updatedChar);
         });
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error("Chat Error:", error);
+      const errText = error?.message || 'Something went wrong. Please try again.';
+      setMessages(prev => [...prev, {
+        id: (Date.now() + 2).toString(),
+        role: 'system',
+        text: errText,
+        timestamp: Date.now()
+      }]);
+      if (/api key/i.test(errText)) {
+        setShowKeyModal(true);
+      }
     } finally {
       setIsTyping(false);
     }
@@ -239,9 +277,16 @@ const App: React.FC = () => {
   const handleGenerateVideoClick = async () => {
     if (!activeCharacter) return;
 
-    const hasKey = await (window as any).aistudio.hasSelectedApiKey();
-    if (!hasKey) {
-      await (window as any).aistudio.openSelectKey();
+    // window.aistudio only exists when running inside the AI Studio frame
+    const aistudio = (window as any).aistudio;
+    if (aistudio?.hasSelectedApiKey) {
+      const hasKey = await aistudio.hasSelectedApiKey();
+      if (!hasKey) {
+        await aistudio.openSelectKey();
+      }
+    } else if (!hasApiKey()) {
+      setShowKeyModal(true);
+      return;
     }
 
     setIsVideoGenerating(true);
@@ -267,8 +312,15 @@ const App: React.FC = () => {
     } catch (error: any) {
       console.error("Video Gen Error:", error);
       if (error.message?.toLowerCase().includes("not found") || error.status === 404) {
-        alert("The selected project might not have access to the Veo model or the API key is invalid for this model. Please select a valid paid project key.");
-        await (window as any).aistudio.openSelectKey();
+        alert("Video generation (Veo) requires an API key from a Google Cloud project with billing enabled — it is not available on the free tier. Please use a paid project key.");
+        const aistudio = (window as any).aistudio;
+        if (aistudio?.openSelectKey) {
+          await aistudio.openSelectKey();
+        } else {
+          setShowKeyModal(true);
+        }
+      } else {
+        alert(`Video generation failed: ${error.message || 'Unknown error'}`);
       }
     } finally {
       setIsVideoGenerating(false);
@@ -296,7 +348,7 @@ const App: React.FC = () => {
     // If we're editing the currently active character, we must refresh the chat logic
     if (activeCharacter?.id === char.id) {
         setActiveCharacter(char);
-        chatRef.current = startTextChat(char);
+        initChat(char);
         // We don't clear messages here so the conversation continues with the new logic
         setMessages(prev => [...prev, {
             id: Date.now().toString(),
@@ -330,10 +382,17 @@ const App: React.FC = () => {
     <div className="flex h-screen bg-[#030712] overflow-hidden">
       {/* Sidebar - Hidden on mobile */}
       <aside className="hidden md:flex w-80 flex-col border-r border-slate-800 glass-panel">
-        <div className="p-6 border-b border-slate-800">
+        <div className="p-6 border-b border-slate-800 flex items-center justify-between">
           <h1 className="text-2xl font-outfit font-bold bg-clip-text text-transparent bg-gradient-to-r from-purple-400 to-pink-500">
             PersonaX
           </h1>
+          <button
+            onClick={() => setShowKeyModal(true)}
+            title="Gemini API Key"
+            className={`p-2 rounded-full transition-all ${hasApiKey() ? 'text-slate-500 hover:text-purple-400 hover:bg-slate-800' : 'text-amber-400 bg-amber-500/10 animate-pulse'}`}
+          >
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" /></svg>
+          </button>
         </div>
         
         <div className="p-4 space-y-2 border-b border-slate-800">
@@ -567,9 +626,16 @@ const App: React.FC = () => {
                 <h1 className="text-4xl md:text-6xl font-outfit font-black mb-3 md:mb-4 tracking-tighter text-white relative">
                   Persona<span className="text-purple-500">X</span>
                 </h1>
-                <p className="text-slate-400 max-w-md mx-auto text-xs md:text-sm mb-6 md:mb-8 px-4">
+                <p className="text-slate-400 max-w-md mx-auto text-xs md:text-sm mb-4 px-4">
                   {view === 'my' ? 'Private Bond Archives' : view === 'archives' ? 'Revisit Roleplay Moments' : 'Discover New Archetypes'}
                 </p>
+
+                <button
+                  onClick={() => setShowKeyModal(true)}
+                  className={`md:hidden mb-6 px-4 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-widest border transition-all ${hasApiKey() ? 'border-slate-700 text-slate-500' : 'border-amber-500/50 text-amber-400 animate-pulse'}`}
+                >
+                  {hasApiKey() ? 'API Key ✓' : 'Set API Key'}
+                </button>
                 
                 <div className="hidden md:flex gap-4">
                   <button onClick={() => setView('my')} className={`px-6 py-2 rounded-full font-bold transition-all ${view === 'my' ? 'bg-purple-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-slate-200'}`}>Bonds</button>
@@ -636,6 +702,46 @@ const App: React.FC = () => {
           <VoiceInterface character={activeCharacter} onClose={() => setShowVoice(false)} onSettingsChange={handleVoiceSettingsChange} />
         )}
       </main>
+
+      {/* API Key Modal */}
+      {showKeyModal && (
+        <div className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
+          <div className="glass-panel w-full max-w-md rounded-3xl border border-purple-500/30 p-6 md:p-8 animate-in fade-in zoom-in duration-300">
+            <h3 className="text-xl font-outfit font-bold text-white mb-2">Connect Gemini API Key</h3>
+            <p className="text-xs text-slate-400 leading-relaxed mb-5">
+              PersonaX runs on the Gemini API free tier. Get a free key at{' '}
+              <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-purple-400 underline hover:text-purple-300">
+                aistudio.google.com/apikey
+              </a>{' '}
+              and paste it below. It is stored only in this browser. Video generation (Veo) additionally requires a key from a billing-enabled project.
+            </p>
+            <input
+              type="password"
+              value={keyInput}
+              onChange={e => setKeyInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') handleSaveApiKey(); }}
+              placeholder={hasApiKey() ? 'Key already set — paste to replace' : 'AIza...'}
+              className="w-full bg-slate-900/70 border border-slate-700 rounded-2xl px-5 py-4 mb-4 focus:ring-2 focus:ring-purple-500 outline-none transition-all text-white placeholder:text-slate-600 text-sm font-mono"
+              autoFocus
+            />
+            <div className="flex gap-3">
+              <button
+                onClick={() => { setKeyInput(''); setShowKeyModal(false); }}
+                className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold rounded-xl transition-all text-xs uppercase tracking-widest"
+              >
+                {hasApiKey() ? 'Close' : 'Later'}
+              </button>
+              <button
+                onClick={handleSaveApiKey}
+                disabled={!keyInput.trim()}
+                className="flex-1 py-3 bg-gradient-to-r from-purple-600 to-pink-600 hover:opacity-90 text-white font-bold rounded-xl transition-all disabled:opacity-40 text-xs uppercase tracking-widest"
+              >
+                Save Key
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Creation/Edit Modal */}
       {isCreating && (

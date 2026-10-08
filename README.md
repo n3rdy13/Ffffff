@@ -15,6 +15,16 @@ View your app in AI Studio: https://ai.studio/apps/220daf3c-c8b7-49b6-aa77-e833d
 
 1. Install dependencies:
    `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
+2. Run the app:
    `npm run dev`
+3. On first launch the app asks for a Gemini API key — get a free one at
+   https://aistudio.google.com/apikey and paste it in. The key is stored only
+   in your browser (localStorage).
+
+   Alternatively, copy `.env.local.example` to `.env.local`, set
+   `GEMINI_API_KEY` there, and restart the dev server.
+
+**Note on models:** the app defaults to free-tier Gemini models (chat, TTS,
+live voice, and image generation via `gemini-2.5-flash-image`). Video
+generation (Veo) and Imagen portraits require an API key from a project with
+billing enabled; the app falls back or explains this when they're unavailable.

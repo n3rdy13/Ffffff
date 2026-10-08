@@ -1,32 +1,79 @@
 
-import { GoogleGenAI, GenerateContentResponse, Chat, Modality, Type } from "@google/genai";
+import { GoogleGenAI, GenerateContentResponse, Chat, Modality, Type, HarmCategory, HarmBlockThreshold, SafetySetting } from "@google/genai";
 import { Character, Message } from "../types";
 import { buildSystemPrompt } from "../constants";
 
-const getAIClient = () => new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+// Default model line-up. Everything here is eligible for the Gemini API free
+// tier, so the app works with a free key from https://aistudio.google.com/apikey.
+// Imagen portraits and Veo video require a key from a billing-enabled project;
+// the code paths that use them fall back or explain when they're unavailable.
+export const TEXT_MODEL = 'gemini-3-flash-preview';
+export const IMAGE_MODEL_FREE = 'gemini-2.5-flash-image';
+export const IMAGE_MODEL_PREMIUM = 'imagen-4.0-generate-001';
+export const TTS_MODEL = 'gemini-2.5-flash-preview-tts';
+export const LIVE_MODEL = 'gemini-2.5-flash-native-audio-preview-12-2025';
+export const VIDEO_MODEL = 'veo-3.1-fast-generate-preview';
 
-const getSafetySettings = (spicy: boolean) => {
+const API_KEY_STORAGE = 'personax_api_key';
+
+export const getApiKey = (): string => {
+  try {
+    const stored = localStorage.getItem(API_KEY_STORAGE);
+    if (stored) return stored;
+  } catch {
+    // localStorage unavailable (private mode etc.) — fall through to env key
+  }
+  return process.env.API_KEY || '';
+};
+
+export const saveApiKey = (key: string): void => {
+  try {
+    if (key) {
+      localStorage.setItem(API_KEY_STORAGE, key);
+    } else {
+      localStorage.removeItem(API_KEY_STORAGE);
+    }
+  } catch {
+    // localStorage unavailable — key will only last for this page load via env
+  }
+};
+
+export const hasApiKey = (): boolean => !!getApiKey();
+
+export class MissingApiKeyError extends Error {
+  constructor() {
+    super('No Gemini API key set. Get a free key at aistudio.google.com/apikey and add it via the key button, or set GEMINI_API_KEY in .env.local.');
+    this.name = 'MissingApiKeyError';
+  }
+}
+
+const getAIClient = () => {
+  const apiKey = getApiKey();
+  if (!apiKey) throw new MissingApiKeyError();
+  return new GoogleGenAI({ apiKey });
+};
+
+const getSafetySettings = (spicy: boolean): SafetySetting[] | undefined => {
   if (!spicy) return undefined;
   return [
-    { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-    { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' },
+    { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+    { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
   ];
 };
 
 export const startTextChat = (character: Character): Chat => {
   const ai = getAIClient();
-  const safetySettings = getSafetySettings(character.spicyMode);
 
   return ai.chats.create({
-    model: 'gemini-3-flash-preview',
+    model: TEXT_MODEL,
     config: {
       systemInstruction: buildSystemPrompt(character),
       temperature: 0.9,
       topP: 0.95,
+      safetySettings: getSafetySettings(character.spicyMode),
     },
-    safetySettings,
   });
 };
 
@@ -52,9 +99,11 @@ export const summarizeMemory = async (character: Character, history: Message[]):
     `.trim();
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
+      model: TEXT_MODEL,
       contents: prompt,
-      safetySettings: getSafetySettings(character.spicyMode),
+      config: {
+        safetySettings: getSafetySettings(character.spicyMode),
+      },
     });
 
     return response.text || character.memory;
@@ -70,7 +119,7 @@ export const analyzeRelationship = async (character: Character, history: Message
     const chatHistory = history.slice(-10).map(m => `${m.role === 'user' ? 'User' : m.role === 'system' ? 'System' : character.name}: ${m.text}`).join('\n');
     
     const response = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
+      model: TEXT_MODEL,
       contents: `
         Character: ${character.name}
         Current Bond Level: ${character.bondLevel} (0-100)
@@ -92,9 +141,9 @@ export const analyzeRelationship = async (character: Character, history: Message
             bondStatus: { type: Type.STRING }
           },
           required: ["bondLevel", "bondStatus"]
-        }
+        },
+        safetySettings: getSafetySettings(character.spicyMode),
       },
-      safetySettings: getSafetySettings(character.spicyMode),
     });
 
     const result = JSON.parse(response.text || '{}');
@@ -109,35 +158,39 @@ export const analyzeRelationship = async (character: Character, history: Message
 };
 
 export const generateCharacterImage = async (prompt: string): Promise<string | null> => {
+  // Free-tier model first; Imagen needs a billing-enabled project, so it is
+  // only tried as a fallback for keys that have access to it.
   try {
     const ai = getAIClient();
-    const response = await ai.models.generateImages({
-      model: 'imagen-4.0-generate-001',
-      prompt: `High quality character portrait: ${prompt}, vibrant colors, detailed features, cinematic lighting, 8k resolution, photorealistic`,
-      config: {
-        numberOfImages: 1,
-        aspectRatio: '1:1',
-      }
+    const response = await ai.models.generateContent({
+      model: IMAGE_MODEL_FREE,
+      contents: {
+        parts: [{ text: `High quality character portrait: ${prompt}, vibrant colors, detailed features, cinematic lighting` }],
+      },
     });
 
-    const base64EncodeString: string = response.generatedImages[0].image.imageBytes;
-    return `data:image/png;base64,${base64EncodeString}`;
+    for (const part of response.candidates?.[0]?.content?.parts || []) {
+      if (part.inlineData?.data) {
+        return `data:image/png;base64,${part.inlineData.data}`;
+      }
+    }
+    throw new Error('No image returned');
   } catch (error) {
     console.error("Image generation failed:", error);
-    // Fallback to flash image if Imagen fails (e.g. key permissions)
     try {
       const ai = getAIClient();
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash-image',
-        contents: {
-          parts: [{ text: `High quality character portrait: ${prompt}, vibrant colors, detailed features, cinematic lighting` }],
-        },
+      const response = await ai.models.generateImages({
+        model: IMAGE_MODEL_PREMIUM,
+        prompt: `High quality character portrait: ${prompt}, vibrant colors, detailed features, cinematic lighting, 8k resolution, photorealistic`,
+        config: {
+          numberOfImages: 1,
+          aspectRatio: '1:1',
+        }
       });
 
-      for (const part of response.candidates[0].content.parts) {
-        if (part.inlineData) {
-          return `data:image/png;base64,${part.inlineData.data}`;
-        }
+      const base64EncodeString = response.generatedImages?.[0]?.image?.imageBytes;
+      if (base64EncodeString) {
+        return `data:image/png;base64,${base64EncodeString}`;
       }
     } catch (innerError) {
       console.error("Fallback image generation also failed:", innerError);
@@ -147,8 +200,8 @@ export const generateCharacterImage = async (prompt: string): Promise<string | n
 };
 
 export const generateVideo = async (character: Character, history: Message[], cameraFrameBase64?: string | null): Promise<string | null> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-  
+  const ai = getAIClient();
+
   try {
     const recentChat = history.map(m => {
       const speaker = m.role === 'user' ? 'User' : m.role === 'system' ? 'System' : character.name;
@@ -178,9 +231,11 @@ export const generateVideo = async (character: Character, history: Message[], ca
     `;
 
     const promptResponse = await ai.models.generateContent({
-      model: 'gemini-3-flash-preview',
+      model: TEXT_MODEL,
       contents: promptEngineeringRequest,
-      safetySettings: getSafetySettings(character.spicyMode),
+      config: {
+        safetySettings: getSafetySettings(character.spicyMode),
+      },
     });
 
     const refinedPrompt = promptResponse.text || `Cinematic shot of ${character.name}, looking emotionally at the camera.`;
@@ -188,7 +243,7 @@ export const generateVideo = async (character: Character, history: Message[], ca
     let operation;
     if (cameraFrameBase64) {
       operation = await ai.models.generateVideos({
-        model: 'veo-3.1-fast-generate-preview',
+        model: VIDEO_MODEL,
         prompt: refinedPrompt,
         image: {
           imageBytes: cameraFrameBase64.split(',')[1] || cameraFrameBase64,
@@ -202,7 +257,7 @@ export const generateVideo = async (character: Character, history: Message[], ca
       });
     } else {
       operation = await ai.models.generateVideos({
-        model: 'veo-3.1-fast-generate-preview',
+        model: VIDEO_MODEL,
         prompt: refinedPrompt,
         config: {
           numberOfVideos: 1,
@@ -220,7 +275,7 @@ export const generateVideo = async (character: Character, history: Message[], ca
     const downloadLink = operation.response?.generatedVideos?.[0]?.video?.uri;
     if (!downloadLink) return null;
 
-    const response = await fetch(`${downloadLink}&key=${process.env.API_KEY}`);
+    const response = await fetch(`${downloadLink}&key=${getApiKey()}`);
     const blob = await response.blob();
     return URL.createObjectURL(blob);
   } catch (error) {
@@ -234,7 +289,7 @@ export const speakText = async (text: string, character: Character): Promise<voi
     const prompt = `[Mood: ${character.voiceSettings.emotion}, Character: ${character.name}, Bond: ${character.bondStatus}] Speak the following: ${text}`;
     
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-preview-tts",
+      model: TTS_MODEL,
       contents: [{ parts: [{ text: prompt }] }],
       config: {
         responseModalities: [Modality.AUDIO],
@@ -243,8 +298,8 @@ export const speakText = async (text: string, character: Character): Promise<voi
             prebuiltVoiceConfig: { voiceName: character.voiceName },
           },
         },
+        safetySettings: getSafetySettings(character.spicyMode),
       },
-      safetySettings: getSafetySettings(character.spicyMode),
     });
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;

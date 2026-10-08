@@ -3,7 +3,7 @@ import React, { useEffect, useRef, useState, useCallback } from 'react';
 import { GoogleGenAI, LiveServerMessage, Modality } from '@google/genai';
 import { Character } from '../types';
 import { buildSystemPrompt, EMOTION_OPTIONS } from '../constants';
-import { decodeAudioData, decodePCM, encodePCM } from '../services/geminiService';
+import { decodeAudioData, decodePCM, encodePCM, getApiKey, LIVE_MODEL } from '../services/geminiService';
 
 interface VoiceInterfaceProps {
   character: Character;
@@ -64,8 +64,13 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
   };
 
   const startSession = async () => {
+    const apiKey = getApiKey();
+    if (!apiKey) {
+      alert('No Gemini API key set. Close this screen and add one via the key button (free at aistudio.google.com/apikey).');
+      return;
+    }
     setIsConnecting(true);
-    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
+    const ai = new GoogleGenAI({ apiKey });
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -75,7 +80,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
       const inputRate = audioContextRef.current.sampleRate;
 
       const sessionPromise = ai.live.connect({
-        model: 'gemini-2.5-flash-native-audio-preview-12-2025',
+        model: LIVE_MODEL,
         callbacks: {
           onopen: () => {
             setIsConnecting(false);
@@ -105,7 +110,7 @@ const VoiceInterface: React.FC<VoiceInterfaceProps> = ({ character, onClose, onS
             scriptProcessor.connect(audioContextRef.current!.destination);
           },
           onmessage: async (message: LiveServerMessage) => {
-            const base64Audio = message.serverContent?.modelTurn?.parts[0]?.inlineData?.data;
+            const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
             if (base64Audio) {
               setIsSpeaking(true);
               const outCtx = outputAudioContextRef.current!;

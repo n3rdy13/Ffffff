@@ -1,8 +1,8 @@
 
 import React, { useState } from 'react';
-import { Character, Relationship, Appearance, VoiceSettings, AdvancedTraits } from '../types';
+import { Character, Relationship, Appearance, VoiceSettings, AdvancedTraits, Message } from '../types';
 import { VOICE_NAMES, APPEARANCE_OPTIONS, DEFAULT_APPEARANCE, DEFAULT_VOICE_SETTINGS, DEFAULT_ADVANCED_TRAITS, EMOTION_OPTIONS, buildImagePrompt, getBondDescription } from '../constants';
-import { generateCharacterImage } from '../services/geminiService';
+import { generateCharacterImage, summarizeMemory } from '../services/geminiService';
 import AdvancedPersonalityEditor from './AdvancedPersonalityEditor';
 
 interface CharacterCreatorProps {
